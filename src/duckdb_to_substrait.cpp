@@ -34,10 +34,11 @@ string GetDecimalInternalString(duckdb::Value &value) {
 		throw runtime_error("Not accepted internal type for decimal");
 	}
 }
-void DuckDBToSubstrait::TransformConstant(duckdb::Value &dval, substrait::Expression_Literal &sval) {
+void DuckDBToSubstrait::TransformConstant(duckdb::Value &dval, substrait::Expression &sexpr) {
 	auto &duckdb_type = dval.type();
 	switch (duckdb_type.id()) {
 	case duckdb::LogicalTypeId::DECIMAL: {
+		auto &sval = *sexpr.mutable_literal();
 		auto *allocated_decimal = new ::substrait::Expression_Literal_Decimal();
 		uint8_t scale, width;
 		dval.type().GetDecimalProperties(width, scale);
@@ -50,23 +51,49 @@ void DuckDBToSubstrait::TransformConstant(duckdb::Value &dval, substrait::Expres
 		break;
 	}
 	case duckdb::LogicalTypeId::INTEGER: {
+		auto &sval = *sexpr.mutable_literal();
 		sval.set_i32(dval.GetValue<int32_t>());
 		break;
 	}
 	case duckdb::LogicalTypeId::BIGINT: {
+		auto &sval = *sexpr.mutable_literal();
 		sval.set_i64(dval.GetValue<int64_t>());
 		break;
 	}
 	case duckdb::LogicalTypeId::DATE: {
 		// TODO how are we going to represent dates?
+		auto &sval = *sexpr.mutable_literal();
 		sval.set_string(dval.ToString());
 		break;
 	}
 	case duckdb::LogicalTypeId::VARCHAR: {
+		auto &sval = *sexpr.mutable_literal();
 		sval.set_string(dval.GetValue<string>());
 		break;
 	}
 
+	case duckdb::LogicalTypeId::HUGEINT: {
+		// Must create a cast from decimal to hugeint
+		auto sfun = sexpr.mutable_scalar_function();
+		sfun->set_function_reference(RegisterFunction("cast"));
+		auto &sval = *sfun->add_args()->mutable_literal();
+		auto *allocated_decimal = new ::substrait::Expression_Literal_Decimal();
+		auto hugeint_str = dval.ToString();
+		allocated_decimal->set_scale(0);
+		allocated_decimal->set_precision((int32_t)hugeint_str.size());
+
+		auto *decimal_value = new string();
+		*decimal_value = hugeint_str;
+		allocated_decimal->set_allocated_value(decimal_value);
+		sval.set_allocated_decimal(allocated_decimal);
+		sfun->add_args()->mutable_literal()->set_string("HUGEINT");
+		break;
+	}
+	case duckdb::LogicalTypeId::BOOLEAN: {
+		auto &sval = *sexpr.mutable_literal();
+		sval.set_boolean(dval.GetValue<bool>());
+		break;
+	}
 	default:
 		throw runtime_error(duckdb_type.ToString());
 	}
@@ -101,8 +128,7 @@ void DuckDBToSubstrait::TransformExpr(duckdb::Expression &dexpr, substrait::Expr
 	}
 	case duckdb::ExpressionType::VALUE_CONSTANT: {
 		auto &dconst = (duckdb::BoundConstantExpression &)dexpr;
-		auto sconst = sexpr.mutable_literal();
-		TransformConstant(dconst.value, *sconst);
+		TransformConstant(dconst.value, sexpr);
 		return;
 	}
 	case duckdb::ExpressionType::COMPARE_EQUAL:
@@ -127,7 +153,7 @@ void DuckDBToSubstrait::TransformExpr(duckdb::Expression &dexpr, substrait::Expr
 			fname = "lessthanequal";
 			break;
 		case duckdb::ExpressionType::COMPARE_GREATERTHAN:
-			fname = "greatherthan";
+			fname = "greaterthan";
 			break;
 		case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
 			fname = "greaterthanequal";
@@ -163,9 +189,9 @@ void DuckDBToSubstrait::TransformExpr(duckdb::Expression &dexpr, substrait::Expr
 
 		auto scalar_fun = sexpr.mutable_scalar_function();
 		scalar_fun->set_function_reference(RegisterFunction(fname));
-		TransformExpr(*dconj.children[0], *scalar_fun->add_args(), col_offset);
-		TransformExpr(*dconj.children[1], *scalar_fun->add_args(), col_offset);
-
+		for (auto &child : dconj.children) {
+			TransformExpr(*child, *scalar_fun->add_args(), col_offset);
+		}
 		return;
 	}
 	case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL: {
@@ -241,7 +267,7 @@ void DuckDBToSubstrait::TransformFilter(uint64_t col_idx, duckdb::TableFilter &d
 		auto &constant_filter = (duckdb::ConstantFilter &)dfilter;
 		CreateFieldRef(sfilter.mutable_scalar_function()->add_args(), col_idx);
 
-		TransformConstant(constant_filter.constant, *sfilter.mutable_scalar_function()->add_args()->mutable_literal());
+		TransformConstant(constant_filter.constant, *sfilter.mutable_scalar_function()->add_args());
 
 		uint64_t function_id;
 		switch (constant_filter.comparison_type) {
@@ -327,6 +353,67 @@ void DuckDBToSubstrait::TransformOrder(duckdb::BoundOrderByNode &dordf, substrai
 		throw runtime_error("Unsupported ordering type");
 	}
 	TransformExpr(*dordf.expression, *sordf.mutable_expr());
+}
+
+void DuckDBToSubstrait::ComparisonJoinTransform(duckdb::LogicalOperator &dop, substrait::Rel &sop,
+                                                ::substrait::JoinRel *sjoin, substrait::Rel *sjoin_rel) {
+	auto &djoin = (duckdb::LogicalComparisonJoin &)dop;
+
+	TransformOp(*dop.children[0], *sjoin->mutable_left());
+	TransformOp(*dop.children[1], *sjoin->mutable_right());
+
+	auto left_col_count = dop.children[0]->types.size();
+
+	sjoin->set_allocated_expression(CreateConjunction(
+	    djoin.conditions,
+	    [&](duckdb::JoinCondition &in, substrait::Expression *out, bool recursive) {
+		    TransformJoinCond(in, *out, left_col_count, recursive);
+	    },
+	    false));
+
+	switch (djoin.join_type) {
+	case duckdb::JoinType::INNER:
+		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_INNER);
+		break;
+	case duckdb::JoinType::LEFT:
+		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT);
+		break;
+	case duckdb::JoinType::RIGHT:
+		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_RIGHT);
+		break;
+	case duckdb::JoinType::SINGLE:
+		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_SINGLE);
+		break;
+	case duckdb::JoinType::SEMI:
+		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_SEMI);
+		break;
+	case duckdb::JoinType::MARK:
+		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_MARK);
+		sjoin->set_mark_index(djoin.mark_index);
+		break;
+	default:
+		throw runtime_error("Unsupported join type");
+	}
+
+	// somewhat odd semantics on our side
+	if (djoin.left_projection_map.empty()) {
+		for (uint64_t i = 0; i < dop.children[0]->types.size(); i++) {
+			djoin.left_projection_map.push_back(i);
+		}
+	}
+	if (djoin.right_projection_map.empty()) {
+		for (uint64_t i = 0; i < dop.children[1]->types.size(); i++) {
+			djoin.right_projection_map.push_back(i);
+		}
+	}
+	for (auto left_idx : djoin.left_projection_map) {
+		CreateFieldRef(sop.mutable_project()->add_expressions(), left_idx);
+	}
+
+	for (auto right_idx : djoin.right_projection_map) {
+		CreateFieldRef(sop.mutable_project()->add_expressions(), right_idx + left_col_count);
+	}
+	sop.mutable_project()->set_allocated_input(sjoin_rel);
 }
 
 void DuckDBToSubstrait::TransformOp(duckdb::LogicalOperator &dop, substrait::Rel &sop) {
@@ -416,59 +503,23 @@ void DuckDBToSubstrait::TransformOp(duckdb::LogicalOperator &dop, substrait::Rel
 	}
 
 	case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
-		auto &djoin = (duckdb::LogicalComparisonJoin &)dop;
-
 		auto sjoin_rel = new substrait::Rel();
 		auto sjoin = sjoin_rel->mutable_join();
-
-		TransformOp(*dop.children[0], *sjoin->mutable_left());
-		TransformOp(*dop.children[1], *sjoin->mutable_right());
-
-		auto left_col_count = dop.children[0]->types.size();
-
-		sjoin->set_allocated_expression(CreateConjunction(
-		    djoin.conditions,
-		    [&](duckdb::JoinCondition &in, substrait::Expression *out, bool recursive) {
-			    TransformJoinCond(in, *out, left_col_count, recursive);
-		    },
-		    false));
-
-		switch (djoin.join_type) {
-		case duckdb::JoinType::INNER:
-			sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_INNER);
-			break;
-		case duckdb::JoinType::LEFT:
-			sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT);
-			break;
-		case duckdb::JoinType::RIGHT:
-			sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_RIGHT);
-			break;
-		default:
-			throw runtime_error("Unsupported join type");
-		}
-
-		// somewhat odd semantics on our side
-		if (djoin.left_projection_map.empty()) {
-			for (uint64_t i = 0; i < dop.children[0]->types.size(); i++) {
-				djoin.left_projection_map.push_back(i);
-			}
-		}
-		if (djoin.right_projection_map.empty()) {
-			for (uint64_t i = 0; i < dop.children[1]->types.size(); i++) {
-				djoin.right_projection_map.push_back(i);
-			}
-		}
-		for (auto left_idx : djoin.left_projection_map) {
-			CreateFieldRef(sop.mutable_project()->add_expressions(), left_idx);
-		}
-
-		for (auto right_idx : djoin.right_projection_map) {
-			CreateFieldRef(sop.mutable_project()->add_expressions(), right_idx + left_col_count);
-		}
-		sop.mutable_project()->set_allocated_input(sjoin_rel);
+		sjoin->set_delim_join(false);
+		ComparisonJoinTransform(dop, sop, sjoin, sjoin_rel);
 		return;
 	}
-
+	case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN: {
+		auto &djoin = (duckdb::LogicalDelimJoin &)dop;
+		auto sjoin_rel = new substrait::Rel();
+		auto sjoin = sjoin_rel->mutable_join();
+		sjoin->set_delim_join(true);
+		for (auto &dexpr : djoin.duplicate_eliminated_columns) {
+			TransformExpr(*dexpr, *sjoin->add_duplicate_eliminated_columns());
+		}
+		ComparisonJoinTransform(dop, sop, sjoin, sjoin_rel);
+		return;
+	}
 	case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
 		auto &daggr = (duckdb::LogicalAggregate &)dop;
 		auto saggr = sop.mutable_aggregate();
@@ -524,6 +575,22 @@ void DuckDBToSubstrait::TransformOp(duckdb::LogicalOperator &dop, substrait::Rel
 		sget->mutable_named_table()->add_names(table_scan_bind_data.table->name);
 		sget->mutable_common()->mutable_direct();
 
+		return;
+	}
+
+	case duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
+		auto sub_cross_rel = new substrait::Rel();
+		auto sub_cross_prod = sub_cross_rel->mutable_cross();
+		auto &djoin = (duckdb::LogicalCrossProduct &)dop;
+		TransformOp(*dop.children[0], *sub_cross_prod->mutable_left());
+		TransformOp(*dop.children[1], *sub_cross_prod->mutable_right());
+		auto bindings = djoin.GetColumnBindings();
+
+		for (uint32_t idx = 0; idx < bindings.size(); idx++) {
+			CreateFieldRef(sop.mutable_project()->add_expressions(), idx);
+		}
+
+		sop.mutable_project()->set_allocated_input(sub_cross_rel);
 		return;
 	}
 

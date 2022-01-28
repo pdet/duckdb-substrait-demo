@@ -3,6 +3,8 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/expression/list.hpp"
 #include "duckdb/main/relation/join_relation.hpp"
+#include "duckdb/main/relation/cross_product_relation.hpp"
+
 #include "duckdb/main/relation/limit_relation.hpp"
 #include "duckdb/main/relation/projection_relation.hpp"
 #include "duckdb/main/relation/aggregate_relation.hpp"
@@ -45,6 +47,10 @@ unique_ptr<duckdb::ParsedExpression> SubstraitToDuckDB::TransformExpr(const subs
 			break;
 		}
 
+		case substrait::Expression_Literal::LiteralTypeCase::kBoolean: {
+			dval = duckdb::Value(slit.boolean());
+			break;
+		}
 		case substrait::Expression_Literal::LiteralTypeCase::kI32:
 			dval = duckdb::Value::INTEGER(slit.i32());
 			break;
@@ -75,46 +81,38 @@ unique_ptr<duckdb::ParsedExpression> SubstraitToDuckDB::TransformExpr(const subs
 		if (function_name == "and") {
 			return duckdb::make_unique<duckdb::ConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND,
 			                                                          move(children));
-		}
-		if (function_name == "cast") {
+		} else if (function_name == "cast") {
 			// TODO actually unpack the constant expression here and not rely on ToString
 			auto expr =
 			    duckdb::Parser::ParseExpressionList(duckdb::StringUtil::Format("asdf::%s", children[1]->ToString()));
 			auto &cast = (duckdb::CastExpression &)*expr[0];
 			return duckdb::make_unique<duckdb::CastExpression>(cast.cast_type, move(children[0]));
-		}
-		if (function_name == "or") {
+		} else if (function_name == "or") {
 			return duckdb::make_unique<duckdb::ConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_OR,
 			                                                          move(children));
-		}
-		if (function_name == "lessthan") {
+		} else if (function_name == "lessthan") {
 			return duckdb::make_unique<duckdb::ComparisonExpression>(duckdb::ExpressionType::COMPARE_LESSTHAN,
 			                                                         move(children[0]), move(children[1]));
-		}
-		if (function_name == "equal") {
+		} else if (function_name == "equal") {
 			return duckdb::make_unique<duckdb::ComparisonExpression>(duckdb::ExpressionType::COMPARE_EQUAL,
 			                                                         move(children[0]), move(children[1]));
-		}
-		if (function_name == "notequal") {
+		} else if (function_name == "notequal") {
 			return duckdb::make_unique<duckdb::ComparisonExpression>(duckdb::ExpressionType::COMPARE_NOTEQUAL,
 			                                                         move(children[0]), move(children[1]));
-		}
-		if (function_name == "lessthanequal") {
+		} else if (function_name == "lessthanequal") {
 			return duckdb::make_unique<duckdb::ComparisonExpression>(duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO,
 			                                                         move(children[0]), move(children[1]));
-		}
-		if (function_name == "greaterthanequal") {
+		} else if (function_name == "greaterthanequal") {
 			return duckdb::make_unique<duckdb::ComparisonExpression>(
 			    duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, move(children[0]), move(children[1]));
-		}
-		if (function_name == "greaterthan") {
+		} else if (function_name == "greaterthan") {
 			return duckdb::make_unique<duckdb::ComparisonExpression>(duckdb::ExpressionType::COMPARE_GREATERTHAN,
 			                                                         move(children[0]), move(children[1]));
-		}
-		if (function_name == "is_not_null") {
+		} else if (function_name == "is_not_null") {
 			return duckdb::make_unique<duckdb::OperatorExpression>(duckdb::ExpressionType::OPERATOR_IS_NOT_NULL,
 			                                                       move(children[0]));
 		}
+
 		return duckdb::make_unique<duckdb::FunctionExpression>(function_name, move(children));
 	}
 	case substrait::Expression::RexTypeCase::kIfThen: {
@@ -187,12 +185,31 @@ shared_ptr<duckdb::Relation> SubstraitToDuckDB::TransformOp(const substrait::Rel
 		case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_RIGHT:
 			djointype = duckdb::JoinType::RIGHT;
 			break;
+		case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_MARK:
+			djointype = duckdb::JoinType::MARK;
+			break;
+		case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_SINGLE:
+			djointype = duckdb::JoinType::SINGLE;
+			break;
+		case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_SEMI:
+			djointype = duckdb::JoinType::SEMI;
+			break;
 		default:
 			throw runtime_error("Unsupported join type");
+		}
+		vector<unique_ptr<duckdb::ParsedExpression>> expressions;
+		for (auto &sexpr : sjoin.duplicate_eliminated_columns()) {
+			expressions.push_back(TransformExpr(sexpr));
 		}
 		return duckdb::make_shared<duckdb::JoinRelation>(TransformOp(sjoin.left())->Alias("left"),
 		                                                 TransformOp(sjoin.right())->Alias("right"),
 		                                                 TransformExpr(sjoin.expression()), djointype);
+	}
+	case substrait::Rel::RelTypeCase::kCross: {
+		auto &sub_cross = sop.cross();
+
+		return duckdb::make_shared<duckdb::CrossProductRelation>(TransformOp(sub_cross.left())->Alias("left"),
+		                                                         TransformOp(sub_cross.right())->Alias("right"));
 	}
 	case substrait::Rel::RelTypeCase::kFetch: {
 		auto &slimit = sop.fetch();

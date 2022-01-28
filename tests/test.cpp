@@ -68,7 +68,7 @@ bool CompareQueryResults(QueryResult &actual_result, QueryResult &roundtrip_resu
 			for (idx_t row = 0; row < rchunk->size(); row++) {
 				auto lvalue = lchunk->GetValue(col, row);
 				auto rvalue = rchunk->GetValue(col, row);
-				if (lvalue != rvalue) {
+				if (!(lvalue.IsNull() && rvalue.IsNull()) && lvalue != rvalue) {
 					return false;
 				}
 			}
@@ -179,6 +179,44 @@ TEST_CASE("String Filter", "[Simple]") {
 	roundtrip_query(con, "select * from person where name not like '%special%requests%'");
 }
 
+TEST_CASE("Uncorrelated Scalar", "[Uncorrelated]") {
+	auto db = make_unique<DuckDB>();
+	auto conn = make_unique<Connection>(*db);
+	auto con = *conn;
+	con.Query("CREATE TABLE integers (i integer);");
+	con.Query("insert into integers values (1),(2),(3),(NULL);");
+	roundtrip_query(con, "select i, i + (select MIN(i) from integers) from integers order by i");
+
+}
+
+//TEST_CASE("Uncorrelated Any", "[Uncorrelated]") {
+//	auto db = make_unique<DuckDB>();
+//	auto conn = make_unique<Connection>(*db);
+//	auto con = *conn;
+//	con.Query("CREATE TABLE integers (i integer);");
+//	con.Query("insert into integers values (1),(2),(3),(NULL);");
+//	roundtrip_query(con, "select i = ANY(select * from integers where i is not null) from integers");
+//}
+
+TEST_CASE("Uncorrelated Exist", "[Uncorrelated]") {
+	auto db = make_unique<DuckDB>();
+	auto conn = make_unique<Connection>(*db);
+	auto con = *conn;
+	con.Query("CREATE TABLE integers (i integer);");
+	con.Query("insert into integers values (1),(2),(3),(NULL);");
+	roundtrip_query(con, "select i, exists (select * from integers where i > 2) from integers");
+}
+
+TEST_CASE("Self-Join", "[join]") {
+	auto db = make_unique<DuckDB>();
+	auto conn = make_unique<Connection>(*db);
+	auto con = *conn;
+	con.Query("CREATE TABLE integers (i integer);");
+	con.Query("insert into integers values (1),(2),(3),(NULL);");
+	roundtrip_query(con, "select i1.i from integers i1 inner join integers i2 on (i1.i = i2.i) ");
+}
+
+//
 void test_tpch(int query_number) {
 	if (initialize) {
 		initialize = false;
@@ -187,11 +225,12 @@ void test_tpch(int query_number) {
 	auto query = TPCHExtension::GetQuery(query_number);
 	roundtrip_query(tpch_con, query);
 }
-
 TEST_CASE("TPC-H Q 01", "[tpch]") {
 	test_tpch(1);
 }
 
+// Missing DELIM_JOIN
+// Missing DELIM_GET
 // TEST_CASE("TPC-H Q 02", "[tpch]") {
 //	test_tpch(2);
 // }
@@ -200,9 +239,9 @@ TEST_CASE("TPC-H Q 03", "[tpch]") {
 	test_tpch(3);
 }
 
-// TEST_CASE("TPC-H Q 04", "[tpch]") {
-//	test_tpch(4);
-// }
+TEST_CASE("TPC-H Q 04", "[tpch]") {
+	test_tpch(4);
+}
 
 TEST_CASE("TPC-H Q 05", "[tpch]") {
 	test_tpch(5);
@@ -244,34 +283,41 @@ TEST_CASE("TPC-H Q 14", "[tpch]") {
 	test_tpch(14);
 }
 
+// empty function name
 // TEST_CASE("TPC-H Q 15", "[tpch]") {
 //	test_tpch(15);
 // }
-//
+
+// Mark Join + Chunk Get
 // TEST_CASE("TPC-H Q 16", "[tpch]") {
 //	test_tpch(16);
 // }
-//
+
+// Delim Join
 // TEST_CASE("TPC-H Q 17", "[tpch]") {
 //	test_tpch(17);
 // }
-//
-// TEST_CASE("TPC-H Q 18", "[tpch]") {
-//	test_tpch(18);
-// }
-//
-// TEST_CASE("TPC-H Q 19", "[tpch]") {
-//	test_tpch(19);
-// }
-//
+
+TEST_CASE("TPC-H Q 18", "[tpch]") {
+	test_tpch(18);
+}
+
+//  Filters
+TEST_CASE("TPC-H Q 19", "[tpch]") {
+	test_tpch(19);
+}
+
+// Delim Join
 // TEST_CASE("TPC-H Q 20", "[tpch]") {
 //	test_tpch(20);
 // }
-//
+
+// Delim Join
 // TEST_CASE("TPC-H Q 21", "[tpch]") {
 //	test_tpch(21);
 // }
-//
+
+//  Mark Join + Chunk Get
 // TEST_CASE("TPC-H Q 22", "[tpch]") {
 //	test_tpch(22);
 // }

@@ -40,10 +40,11 @@ public:
 
 private:
 	uint64_t RegisterFunction(std::string name);
-	static void CreateFieldRef(substrait::Expression *expr, uint64_t col_idx);
-
+	void CreateFieldRef(substrait::Expression *expr, uint64_t col_idx);
+	void ComparisonJoinTransform(duckdb::LogicalOperator &dop, substrait::Rel &sop, ::substrait::JoinRel *sjoin,
+	                             substrait::Rel *sjoin_rel);
 	void TransformOp(duckdb::LogicalOperator &dop, substrait::Rel &sop);
-	static void TransformConstant(duckdb::Value &dval, substrait::Expression_Literal &sval);
+	void TransformConstant(duckdb::Value &dval, substrait::Expression &sexpr);
 	void TransformExpr(duckdb::Expression &dexpr, substrait::Expression &sexpr, uint64_t col_offset = 0);
 	void TransformFilter(uint64_t col_idx, duckdb::TableFilter &dfilter, substrait::Expression &sfilter,
 	                     bool recursive);
